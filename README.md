@@ -1,6 +1,6 @@
 # OBS Sınav Bildirim Scripti
 
-OBS'deki sınav sonuçlarını ve hocalardan gelen mesajları (Yazışmalarım) takip eder; yeni bir sınav açıklandığında, bir not değiştiğinde veya hocadan yeni mesaj geldiğinde mail atar.
+OBS'deki sınav sonuçlarını, hocalardan gelen mesajları (Yazışmalarım) ve Doküman Paylaşımı'ndaki dosyaları takip eder; yeni bir sınav açıklandığında, bir not değiştiğinde, hocadan yeni mesaj geldiğinde veya yeni doküman paylaşıldığında mail atar.
 
 ## Kurulum
 
@@ -49,5 +49,6 @@ Tüm ayarlar `.env` dosyasında. Bu dosya `.gitignore`'da, GitHub'a gitmez.
 
 - Alıcıları `EMAIL_TO_LIST`'e virgülle ayırarak yaz.
 - `CHECK_MESSAGES`: mesaj takibini açar/kapatır (varsayılan `true`).
+- `CHECK_DOCUMENTS`: doküman takibini açar/kapatır (varsayılan `true`, 5 dakikada bir kontrol edilir).
 - `CHECK_INTERVAL`: kaç saniyede bir kontrol edileceği (varsayılan 30).
 - Script son durumu `sinav_durumu.json`'a kaydeder; kapatıp açınca eski notlar için tekrar mail atmaz.

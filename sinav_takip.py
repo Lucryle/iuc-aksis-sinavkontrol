@@ -2,9 +2,10 @@
 """
 IUC OBS Sinav Takip
 
-OBS'deki sinav sonuclarini ve hocalardan gelen mesajlari (Yazismalarim)
-periyodik olarak kontrol eder; yeni bir sinav aciklandiginda, bir not
-degistiginde veya yeni mesaj geldiginde e-posta gonderir.
+OBS'deki sinav sonuclarini, hocalardan gelen mesajlari (Yazismalarim) ve
+Dokuman Paylasimi'ndaki dosyalari periyodik olarak kontrol eder; yeni bir
+sinav aciklandiginda, bir not degistiginde, yeni mesaj geldiginde veya
+yeni dokuman paylasildiginda e-posta gonderir.
 
 Kullanim:
     python sinav_takip.py                 # surekli takip
@@ -39,6 +40,10 @@ EXAM_URL = f"{OBS_URL}/OgrenimBilgileri/SinavSonuclariVeNotlar/GetOgrenciSinavSo
 DISTRIBUTION_URL = f"{OBS_URL}/OgrenimBilgileri/SinavSonuclariVeNotlar/HarfNotDagilimGoster?SinavID="
 CHAT_PAGE_URL = f"{OBS_URL}/Genel/Chat2"
 MESSAGES_API_URL = f"{OBS_URL}/api/Yazisma/GetirYazismalar"
+DOCS_PAGE_URL = f"{OBS_URL}/Dokuman/Dokuman/Index"
+DOCS_COURSES_URL = f"{OBS_URL}/Dokuman/Dokuman/DersListesi"
+DOCS_LIST_URL = f"{OBS_URL}/Dokuman/Dokuman/DersIzlence"
+DOCS_CHECK_EVERY_SECONDS = 5 * 60  # dokumanlar icin daha seyrek kontrol yeterli
 
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36")
@@ -72,6 +77,7 @@ class Config:
     interval: int
     verify_ssl: bool
     check_messages: bool
+    check_documents: bool
     smtp_server: str = "smtp.gmail.com"
     smtp_port: int = 587
 
@@ -114,6 +120,7 @@ def load_config(args):
         interval=int(env("CHECK_INTERVAL", "30")),
         verify_ssl=env("VERIFY_SSL", "false").lower() in ("1", "true", "yes"),
         check_messages=env("CHECK_MESSAGES", "true").lower() in ("1", "true", "yes"),
+        check_documents=env("CHECK_DOCUMENTS", "true").lower() in ("1", "true", "yes"),
     )
     missing = [name for name, value in [
         ("AKSIS_USERNAME", cfg.username), ("AKSIS_PASSWORD", cfg.password),
@@ -234,6 +241,29 @@ class ObsClient:
             self.chat_token = None  # token eskimis olabilir, bir kez yenile
         raise SessionExpired("Mesajlar alinamadi (oturum dusmus olabilir).")
 
+    def _post_json(self, url, body):
+        resp = self.session.post(url, json=body, timeout=30, headers={
+            "Accept": "application/json, text/plain, */*", "Referer": DOCS_PAGE_URL, "Origin": OBS_URL})
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except ValueError:
+            raise SessionExpired("Dokuman Paylasimi JSON yerine HTML dondu (oturum dusmus).")
+
+    def fetch_documents(self):
+        """Bu donemin derslerindeki paylasilan dokumanlar: {dokumanID: dokuman}."""
+        courses = self._post_json(DOCS_COURSES_URL, {"yil": int(self.cfg.yil), "donem": int(self.cfg.donem)})
+        if not isinstance(courses, list):
+            raise SessionExpired(f"Beklenmeyen ders listesi cevabi: {courses!r:.200}")
+        documents = {}
+        for course in courses:
+            docs = self._post_json(DOCS_LIST_URL, {"oGRDersGrupID": course.get("OGRDersGrupID"),
+                                                   "birimID": course.get("BirimID")})
+            for doc in docs if isinstance(docs, list) else []:
+                doc = dict(doc, DersAdi=course.get("DersAdi", ""))
+                documents[str(doc.get("ID"))] = doc
+        return documents
+
 
 # ---------------------------------------------------------- karsilastirma
 def exam_key(item):
@@ -288,6 +318,21 @@ def print_messages(conversations):
         print(f"   [okunmamis] {sender_name(c)} ({c.get('SGZamanString', '')})")
 
 
+def find_new_documents(old, new):
+    return [doc for key, doc in new.items() if key not in old]
+
+
+def document_title(doc):
+    return (doc.get("FileName") or doc.get("Konu") or doc.get("DokumanTuru") or "dokuman").strip()
+
+
+def print_documents(documents):
+    log.info("Dokuman Paylasimi: %d dokuman.", len(documents))
+    for doc in sorted(documents.values(), key=lambda d: (d.get("DersAdi", ""), str(d.get("Hafta", "")))):
+        hafta = f"Hafta {doc['Hafta']} - " if doc.get("Hafta") else ""
+        print(f"   {doc.get('DersAdi', '').strip()}: {hafta}{document_title(doc)}")
+
+
 def print_exams(exams):
     if not exams:
         log.info("Bu donem icin henuz aciklanmis sinav yok.")
@@ -304,21 +349,21 @@ def print_exams(exams):
 
 # ---------------------------------------------------------------- durum
 def load_state(cfg):
-    """(sinavlar, mesajlar) dondurur; ilk calistirmada None olurlar."""
+    """(sinavlar, mesajlar, dokumanlar) dondurur; ilk calistirmada None olurlar."""
     try:
         state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
-        return None, None
-    exams = state.get("exams")
+        return None, None, None
+    exams, documents = state.get("exams"), state.get("documents")
     if state.get("yil") != cfg.yil or state.get("donem") != cfg.donem:
-        exams = None  # donem degismis, sinav listesi sifirdan
-    return exams, state.get("messages")
+        exams = documents = None  # donem degismis, sifirdan basla
+    return exams, state.get("messages"), documents
 
 
-def save_state(cfg, exams, messages):
+def save_state(cfg, exams, messages, documents):
     STATE_PATH.write_text(
-        json.dumps({"yil": cfg.yil, "donem": cfg.donem, "exams": exams, "messages": messages},
-                   ensure_ascii=False, indent=2),
+        json.dumps({"yil": cfg.yil, "donem": cfg.donem, "exams": exams, "messages": messages,
+                    "documents": documents}, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
 
@@ -383,6 +428,47 @@ def notify_messages(cfg, conversations):
         log.error("Mail gonderilemedi: %s", exc)
 
 
+def notify_documents(cfg, docs):
+    if len(docs) == 1:
+        subject = f"Yeni dokuman: {docs[0].get('DersAdi', '').strip()} - {document_title(docs[0])}"
+    else:
+        subject = f"{len(docs)} yeni dokuman paylasildi"
+    blocks = []
+    for doc in docs:
+        lines = [
+            f"Ders     : {doc.get('DersAdi', '').strip()}",
+            f"Dosya    : {document_title(doc)}",
+            f"Tur      : {doc.get('DokumanTuru', '')}",
+        ]
+        for label, key in (("Hafta", "Hafta"), ("Konu", "Konu"), ("Aciklama", "Aciklama"),
+                           ("Tarih", "DokumanTarih"), ("Odev son", "OdevBitisTarihi")):
+            if doc.get(key):
+                lines.append(f"{label:<9}: {doc[key]}")
+        blocks.append("\n".join(lines))
+    body = "\n\n".join(blocks) + f"\n\nDokuman Paylasimi: {DOCS_PAGE_URL}"
+    try:
+        send_mail(cfg, subject, body)
+        log.info("Mail gonderildi: %s", subject)
+    except Exception as exc:
+        log.error("Mail gonderilemedi: %s", exc)
+
+
+def check_documents(cfg, client, known, once):
+    documents = client.fetch_documents()
+    if once:
+        print_documents(documents)
+    elif known is None:
+        log.info("Ilk dokuman sorgusu tamam, %d dokuman kayitli.", len(documents))
+    else:
+        new = find_new_documents(known, documents)
+        for doc in new:
+            log.info("Yeni dokuman: %s - %s", doc.get("DersAdi", "").strip(), document_title(doc))
+        if new:
+            notify_documents(cfg, new)
+    # Sadece ID'leri ve mailde lazim olan alanlari sakla
+    return {k: {f: d.get(f) for f in ("DersAdi", "FileName", "Konu", "Hafta")} for k, d in documents.items()}
+
+
 def check_messages(cfg, client, known, once):
     conversations = client.fetch_messages()
     if once:
@@ -412,11 +498,13 @@ def run(cfg, once=False):
             log.error("%s %d dk sonra tekrar denenecek.", exc, LOGIN_RETRY_SECONDS // 60)
             time.sleep(LOGIN_RETRY_SECONDS)
 
-    known, known_messages = load_state(cfg)
+    known, known_messages, known_documents = load_state(cfg)
+    last_docs_check = 0.0
     backoff = cfg.interval
+    extras = [name for name, on in (("mesajlar", cfg.check_messages), ("dokumanlar", cfg.check_documents)) if on]
     log.info("Takip basladi: %s-%s %s donemi%s, %d sn aralikla.",
              cfg.yil, int(cfg.yil) + 1, "Guz" if cfg.donem == "1" else "Bahar",
-             " + mesajlar" if cfg.check_messages else "", cfg.interval)
+             "".join(" + " + e for e in extras), cfg.interval)
 
     while True:
         try:
@@ -427,6 +515,9 @@ def run(cfg, once=False):
             exams = client.fetch_exams()
             if cfg.check_messages:
                 known_messages = check_messages(cfg, client, known_messages, once)
+            if cfg.check_documents and (once or time.time() - last_docs_check >= DOCS_CHECK_EVERY_SECONDS):
+                known_documents = check_documents(cfg, client, known_documents, once)
+                last_docs_check = time.time()
 
             if once:
                 print_exams(exams)
@@ -444,7 +535,7 @@ def run(cfg, once=False):
                     log.debug("Degisiklik yok (%d sinav).", len(exams))
 
             known = exams
-            save_state(cfg, exams, known_messages)
+            save_state(cfg, exams, known_messages, known_documents)
             backoff = cfg.interval
 
         except (SessionExpired, LoginFailed) as exc:
@@ -463,8 +554,8 @@ def run(cfg, once=False):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="IUC OBS sinav sonucu ve mesaj takibi, mail bildirimi")
-    parser.add_argument("--once", action="store_true", help="bir kez sorgula, notlari ve okunmamis mesajlari yazdir, cik")
+    parser = argparse.ArgumentParser(description="IUC OBS sinav sonucu, mesaj ve dokuman takibi, mail bildirimi")
+    parser.add_argument("--once", action="store_true", help="bir kez sorgula; notlari, okunmamis mesajlari ve dokumanlari yazdir, cik")
     parser.add_argument("--test-mail", action="store_true", help="alicilara test maili gonder ve cik")
     parser.add_argument("--yil", help="akademik yil baslangici (orn. 2026 = 2026-2027)")
     parser.add_argument("--donem", choices=["1", "2"], help="1 = Guz, 2 = Bahar")
