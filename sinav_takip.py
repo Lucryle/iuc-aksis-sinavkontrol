@@ -500,6 +500,7 @@ def run(cfg, once=False):
 
     known, known_messages, known_documents = load_state(cfg)
     last_docs_check = 0.0
+    check_count = 0
     backoff = cfg.interval
     extras = [name for name, on in (("mesajlar", cfg.check_messages), ("dokumanlar", cfg.check_documents)) if on]
     log.info("Takip basladi: %s-%s %s donemi%s, %d sn aralikla.",
@@ -531,12 +532,18 @@ def run(cfg, once=False):
                     for kind, item, _ in changes:
                         log.info("%s: %s -> %s", kind, describe(item), item.get("Notu", ""))
                     notify_changes(cfg, changes)
-                else:
-                    log.debug("Degisiklik yok (%d sinav).", len(exams))
-
             known = exams
             save_state(cfg, exams, known_messages, known_documents)
             backoff = cfg.interval
+
+            check_count += 1
+            summary = [f"{len(exams)} sinav"]
+            if cfg.check_messages:
+                summary.append(f"{len(known_messages or {})} konusma")
+            if cfg.check_documents:
+                summary.append(f"{len(known_documents or {})} dokuman")
+            log.info("Kontrol #%d basarili (%s). Sonraki kontrol %d sn sonra.",
+                     check_count, ", ".join(summary), cfg.interval)
 
         except (SessionExpired, LoginFailed) as exc:
             log.warning("%s Yeniden giris deneniyor...", exc)
