@@ -1,8 +1,28 @@
 # OBS Sınav Bildirim Scripti
 
-## Gerekli Ayarlar
+OBS'deki sınav sonuçlarını ve hocalardan gelen mesajları (Yazışmalarım) takip eder; yeni bir sınav açıklandığında, bir not değiştiğinde veya hocadan yeni mesaj geldiğinde mail atar.
 
-## Önemli: Muhtemelen dönem ayarını değiştirmen gerekecek çünkü burayı sürekli güncellemeyeceğim. en sonu oku.
+## Kurulum
+
+```bash
+pip install requests
+cp .env.example .env   # sonra .env'i doldur (aşağıya bak)
+```
+
+## Kullanım
+
+```bash
+python sinav_takip.py                         # sürekli takip
+python sinav_takip.py --once                  # bir kez sorgula, notları yazdır
+python sinav_takip.py --test-mail             # mail ayarlarını test et
+python sinav_takip.py --yil 2025 --donem 2 --once   # başka dönemi görüntüle
+```
+
+## Gerekli Ayarlar (.env)
+
+Tüm ayarlar `.env` dosyasında. Bu dosya `.gitignore`'da, GitHub'a gitmez.
+
+**Önemli:** Dönem ayarını (`YIL`, `DONEM`) her dönem güncellemen gerekiyor. `YIL=2026 DONEM=1` = 2026-2027 Güz, `DONEM=2` = Bahar.
 
 ### 1. Gmail SMTP Uygulama Şifresi Nasıl Alınır?
 
@@ -10,7 +30,7 @@
 - Google hesabına giriş yap.
 - Sağ üstten **Google Hesabım** → **Güvenlik** → **Uygulama Şifreleri** bölümüne git.
 - **Uygulama Şifresi Oluştur** seçeneğinden bir şifre oluştur.
-- Oluşan şifreyi kodda `EMAIL_PASSWORD` değişkenine yapıştır.
+- Oluşan şifreyi `.env`'de `EMAIL_PASSWORD` alanına yapıştır (gönderen hesabın şifresi).
 - **Not:** Düz mail şifresi ile çalışmaz, mutlaka uygulama şifresi olmalı!
 
 ### 2. KAUTH_COOKIE (AKSISAutKH) Nasıl Alınır?
@@ -21,13 +41,13 @@
 - **Application** (veya bazı tarayıcılarda **Depolama**) sekmesine geç.
 - Sol menüden **Cookies** → **https://aksis.iuc.edu.tr** seç.
 - Sağda **AKSISAutKH** isimli cookie’yi bul, değeri kopyala.
-- Bunu kodda `KAUTH_COOKIE` değişkenine yapıştır.
+- Bunu `.env`'de `KAUTH_COOKIE` alanına yapıştır.
 
 ---
 
 ## Diğer Ayarlar
 
-- Kullanıcı adı, şifre, mail adresleri ve alıcıları kodun en üstünden düzenleyebilirsin. Alıcı ekleyip/silebilirsin.
-- Dönem/yıl ayarını `EXAM_DATA` değişkeninden değiştirebilirsin.
-
----
+- Alıcıları `EMAIL_TO_LIST`'e virgülle ayırarak yaz.
+- `CHECK_MESSAGES`: mesaj takibini açar/kapatır (varsayılan `true`).
+- `CHECK_INTERVAL`: kaç saniyede bir kontrol edileceği (varsayılan 30).
+- Script son durumu `sinav_durumu.json`'a kaydeder; kapatıp açınca eski notlar için tekrar mail atmaz.
