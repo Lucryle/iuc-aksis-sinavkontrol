@@ -33,15 +33,16 @@ Tüm ayarlar `.env` dosyasında. Bu dosya `.gitignore`'da, GitHub'a gitmez.
 - Oluşan şifreyi `.env`'de `EMAIL_PASSWORD` alanına yapıştır (gönderen hesabın şifresi).
 - **Not:** Düz mail şifresi ile çalışmaz, mutlaka uygulama şifresi olmalı!
 
-### 2. KAUTH_COOKIE (AKSISAutKH) Nasıl Alınır?
+### 2. Oturum Cookie'si (IDS_COOKIE) Nasıl Alınır?
 
-- [https://aksis.iuc.edu.tr](https://aksis.iuc.edu.tr) adresine tarayıcıdan giriş yap.
-- Telefon doğrulaması aktif edilmiş olmalı (SMS ile giriş yap).
-- Giriş yaptıktan sonra **F12** ile geliştirici araçlarını aç.
-- **Application** (veya bazı tarayıcılarda **Depolama**) sekmesine geç.
-- Sol menüden **Cookies** → **https://aksis.iuc.edu.tr** seç.
-- Sağda **AKSISAutKH** isimli cookie’yi bul, değeri kopyala.
-- Bunu `.env`'de `KAUTH_COOKIE` alanına yapıştır.
+Aksis artık `teknokta.iuc.edu.tr` kimlik sunucusu üzerinden giriş yapıyor ve giriş formunda robot doğrulaması var. Bu yüzden script şifreyle giriş **yapmaz**; senin tarayıcıda açtığın oturumu kullanır.
+
+- [https://aksis.iuc.edu.tr/giris/main](https://aksis.iuc.edu.tr/giris/main) adresinden giriş yap (Google ile de olur).
+- **F12** → **Network** sekmesi → sayfayı yenile → `aksis.iuc.edu.tr` isteğine tıkla.
+- **Request Headers** altındaki `cookie` değerinin tamamını kopyala.
+- `.env`'de `IDS_COOKIE=` satırına yapıştır (ya da `sinav_takip.py`'deki `HARDCODED_COOKIES`'e).
+
+Script her kontrolde oturumu kullandığı için oturum canlı kalır ve sunucunun yenilediği cookie'yi `.oturum.json`'a kaydeder. Oturum biterse sana mail atar; yeni cookie'yi yapıştırman yeterli.
 
 ---
 

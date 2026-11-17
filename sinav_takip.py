@@ -14,6 +14,13 @@ Kullanim:
     python sinav_takip.py --yil 2025 --donem 2 --once   # baska donemi goruntule
 
 Ayarlar .env dosyasindan okunur (bkz. .env.example).
+
+Giris: Aksis artik teknokta.iuc.edu.tr kimlik sunucusu (OpenID Connect) uzerinden
+giris yapiyor ve giris formunda robot dogrulamasi var. Script sifreyle giris
+YAPMAZ; tarayicida bir kez kendin giris yaptiktan sonra teknokta'nin oturum
+cookie'sini .env'e (IDS_COOKIE) koyarsin, script Aksis/OBS oturumunu bununla
+acar. Oturum biterse mail atar; .env'deki cookie'yi guncellemen yeterli,
+script'i yeniden baslatman gerekmez.
 """
 import argparse
 import json
@@ -33,9 +40,12 @@ import urllib3
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 STATE_PATH = BASE_DIR / "sinav_durumu.json"
+IDS_STATE_PATH = BASE_DIR / ".oturum.json"  # yenilenen kimlik cookie'leri (gitignore'da)
 
 OBS_URL = "https://obs.iuc.edu.tr"
-LOGIN_URL = "https://aksis.iuc.edu.tr/Account/LogOn?returnUrl=%2FAccount%2FLogOff"
+IDS_HOST = "teknokta.iuc.edu.tr"
+
+AKSIS_LOGIN_URL = "https://aksis.iuc.edu.tr/giris/idslogin"
 EXAM_URL = f"{OBS_URL}/OgrenimBilgileri/SinavSonuclariVeNotlar/GetOgrenciSinavSonuc"
 DISTRIBUTION_URL = f"{OBS_URL}/OgrenimBilgileri/SinavSonuclariVeNotlar/HarfNotDagilimGoster?SinavID="
 CHAT_PAGE_URL = f"{OBS_URL}/Genel/Chat2"
@@ -56,7 +66,6 @@ EXAM_HEADERS = {
     "Accept-Language": "tr-TR,tr;q=0.9,en-US;q=0.8,en;q=0.7",
 }
 
-RELOGIN_EVERY_SECONDS = 20 * 60 * 60  # 20 saatte bir yeniden giris
 MAX_BACKOFF_SECONDS = 10 * 60
 LOGIN_RETRY_SECONDS = 5 * 60
 
@@ -66,9 +75,6 @@ log = logging.getLogger("sinav_takip")
 # ----------------------------------------------------------------- ayarlar
 @dataclass
 class Config:
-    username: str
-    password: str
-    kauth_cookie: str
     email_address: str
     email_password: str
     email_to: list
@@ -97,6 +103,50 @@ def load_env(path=ENV_PATH):
         os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
+def read_env_value(key, path=ENV_PATH):
+    """.env'i her seferinde yeniden okur; boylece calisirken guncellenen cookie hemen kullanilir."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return ""
+    for line in lines:
+        line = line.strip()
+        if line.startswith(key) and "=" in line and line.split("=", 1)[0].strip() == key:
+            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def parse_cookie_string(raw):
+    """'idsrv=...; idsrv.session=...' ya da sadece idsrv degeri kabul eder."""
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    if "=" not in raw.split(";")[0]:
+        return {"idsrv": raw}
+    cookies = {}
+    for part in raw.split(";"):
+        if "=" in part:
+            name, value = part.split("=", 1)
+            cookies[name.strip()] = value.strip()
+    return cookies
+
+
+def load_ids_cookies():
+    """.env'deki cookie degismediyse, sunucunun en son yeniledigi halini kullan."""
+    env_raw = read_env_value("IDS_COOKIE")
+    try:
+        saved = json.loads(IDS_STATE_PATH.read_text(encoding="utf-8"))
+        if saved.get("env") == env_raw and saved.get("cookies"):
+            return env_raw, saved["cookies"]
+    except (FileNotFoundError, ValueError):
+        pass
+    return env_raw, parse_cookie_string(env_raw)
+
+
+def save_ids_cookies(env_raw, cookies):
+    IDS_STATE_PATH.write_text(json.dumps({"env": env_raw, "cookies": cookies}, indent=2), encoding="utf-8")
+
+
 def parse_exam_data(raw):
     """Eski format EXAM_DATA (sort=...&yil=2026&donem=1) icin geriye uyumluluk."""
     yil = re.search(r"yil=(\d+)", raw or "")
@@ -109,9 +159,6 @@ def load_config(args):
     env = os.environ.get
     old_yil, old_donem = parse_exam_data(env("EXAM_DATA", ""))
     cfg = Config(
-        username=env("AKSIS_USERNAME", ""),
-        password=env("AKSIS_PASSWORD", ""),
-        kauth_cookie=env("KAUTH_COOKIE", ""),
         email_address=env("EMAIL_ADDRESS", ""),
         email_password=env("EMAIL_PASSWORD", "").replace(" ", ""),
         email_to=[e.strip() for e in env("EMAIL_TO_LIST", "").split(",") if e.strip()],
@@ -123,7 +170,7 @@ def load_config(args):
         check_documents=env("CHECK_DOCUMENTS", "true").lower() in ("1", "true", "yes"),
     )
     missing = [name for name, value in [
-        ("AKSIS_USERNAME", cfg.username), ("AKSIS_PASSWORD", cfg.password),
+        ("IDS_COOKIE", read_env_value("IDS_COOKIE")),
         ("EMAIL_ADDRESS", cfg.email_address), ("EMAIL_PASSWORD", cfg.email_password),
         ("EMAIL_TO_LIST", cfg.email_to),
     ] if not value]
@@ -141,19 +188,38 @@ class LoginFailed(Exception):
     pass
 
 
+class IdsSessionExpired(LoginFailed):
+    """teknokta kimlik oturumu bitmis; kullanicinin tarayicidan tekrar girmesi gerekiyor."""
+
+
 class ObsClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.session = requests.Session()
         self.session.headers["User-Agent"] = USER_AGENT
         self.session.verify = cfg.verify_ssl
+        self.session.hooks["response"].append(lambda resp, *a, **kw: self._adopt_cookies(resp))
         self.last_login = 0.0
         self.chat_token = None
+        self.env_raw = ""
+
+    def _set_cookie(self, name, value):
+        # Ayni isimde tek cookie kalsin (farkli alan adlarindaki kopyalar eski deger gondermesin)
+        for c in [c for c in self.session.cookies if c.name == name]:
+            self.session.cookies.clear(c.domain, c.path, c.name)
+        self.session.cookies.set(name, value, domain=".iuc.edu.tr", path="/")
 
     def _adopt_cookies(self, resp):
-        # aksis ve obs farkli alt alan adlari; cookie'leri ikisinde de gecerli olacak sekilde kopyala
+        # Sunucu bir cookie'yi yenilediyse (or. .OGRISFormAuth) tum iuc.edu.tr alt alanlarinda gecerli yap
         for cookie in resp.cookies:
-            self.session.cookies.set(cookie.name, cookie.value)
+            self._set_cookie(cookie.name, cookie.value)
+
+    def save_session(self):
+        """Guncel oturum cookie'lerini diske yaz; script yeniden baslarsa kaldigi oturumdan devam eder."""
+        current = {c.name: c.value for c in self.session.cookies
+                   if (c.domain or "").endswith("iuc.edu.tr") and not c.name.startswith("_ga")}
+        if current:
+            save_ids_cookies(self.env_raw, current)
 
     def refresh_obs_session(self):
         resp = self.session.get(OBS_URL + "/", timeout=30)
@@ -161,40 +227,58 @@ class ObsClient:
         self._adopt_cookies(resp)
         log.debug("OBS oturumu yenilendi.")
 
-    def login(self):
-        self.session.cookies.clear()  # eski giris cookie'si basari kontrolunu yaniltmasin
-        resp = self.session.get(LOGIN_URL, timeout=30)
-        resp.raise_for_status()
-        self._adopt_cookies(resp)
-        match = re.search(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"', resp.text)
-        if not match:
-            raise LoginFailed("Giris sayfasinda dogrulama token'i bulunamadi (site degismis olabilir).")
+    def _submit_auto_post_form(self, resp):
+        """Kimlik sunucusu form_post kullanirsa otomatik gonderilen formu biz gonderiyoruz."""
+        form = re.search(r'<form[^>]*method=["\']post["\'][^>]*action=["\']([^"\']+)["\'][^>]*>(.*?)</form>',
+                         resp.text, re.S | re.I)
+        if not form or 'type="password"' in resp.text:
+            return None
+        fields = dict(re.findall(r'<input[^>]*name=["\']([^"\']+)["\'][^>]*value=["\']([^"\']*)["\']',
+                                 form.group(2), re.I))
+        if "code" not in fields and "id_token" not in fields:
+            return None
+        action = requests.compat.urljoin(resp.url, form.group(1).replace("&amp;", "&"))
+        return self.session.post(action, data=fields, timeout=30)
 
-        if self.cfg.kauth_cookie:
-            self.session.cookies.set("AKSISAutKH", self.cfg.kauth_cookie)
-        form = {
-            "__RequestVerificationToken": match.group(1),
-            "UserName": self.cfg.username,
-            "Password": self.cfg.password,
-            "IpAddr": "",
-            "SmsDogrulaModal": "0",
-            "SmsDogrulaSecond": "0",
-            "PhoneNumber": "",
-        }
-        resp = self.session.post(
-            LOGIN_URL, data=form, allow_redirects=False, timeout=30,
-            headers={"Origin": "https://aksis.iuc.edu.tr", "Referer": LOGIN_URL},
-        )
+    def _obs_logged_in(self):
+        resp = self.session.get(OBS_URL + "/", timeout=30)
         resp.raise_for_status()
         self._adopt_cookies(resp)
-        if ".OGRISFormAuth" not in self.session.cookies:
-            log.debug("Giris cevabi: HTTP %s, Location=%s", resp.status_code, resp.headers.get("Location"))
-            raise LoginFailed("Giris basarisiz: kullanici adi/sifre yanlis olabilir veya "
-                              "KAUTH_COOKIE suresi dolmus (SMS dogrulamasi istendi).")
-        self.refresh_obs_session()
+        return "/Dokuman/Dokuman/Index" in resp.text or "/Genel/Chat2" in resp.text
+
+    def login(self):
+        """Kayitli oturum cookie'leriyle OBS'ye girer; gerekirse Aksis uzerinden oturumu tazeler."""
+        env_raw, cookies = load_ids_cookies()
+        if not cookies:
+            raise IdsSessionExpired(".env'de IDS_COOKIE bos.")
+
+        self.env_raw = env_raw
+        self.session.cookies.clear()
+        for name, value in cookies.items():
+            self._set_cookie(name, value)
+
+        ok = self._obs_logged_in()
+        if not ok:
+            # OBS cookie'si dusmus olabilir; Aksis oturumu (veya teknokta) uzerinden yenile
+            log.debug("OBS oturumu yok, Aksis uzerinden yenileniyor...")
+            resp = self.session.get(AKSIS_LOGIN_URL, timeout=30)
+            for _ in range(3):
+                next_resp = self._submit_auto_post_form(resp)
+                if next_resp is None:
+                    break
+                resp = next_resp
+            resp.raise_for_status()
+            if requests.utils.urlparse(resp.url).hostname == IDS_HOST:
+                raise IdsSessionExpired("Aksis oturumu bitmis, kimlik sunucusu giris istiyor.")
+            ok = self._obs_logged_in()
+        if not ok:
+            raise IdsSessionExpired("OBS oturumu acilamadi (cookie'lerin suresi dolmus olabilir).")
+
+        self.save_session()
+
         self.chat_token = None
         self.last_login = time.time()
-        log.info("Aksis girisi basarili.")
+        log.info("OBS girisi basarili.")
 
     def fetch_exams(self):
         """Sinav listesini dondurur: {SinavID: item}. Oturum dustuyse bir kez yeniler."""
@@ -484,19 +568,48 @@ def check_messages(cfg, client, known, once):
     return message_state(conversations)
 
 
+def notify_session_expired(cfg, exc):
+    body = (f"Sinav takip script'i OBS'ye giris yapamiyor: {exc}\n\n"
+            "Yapman gereken:\n"
+            "1. Tarayicida https://aksis.iuc.edu.tr/giris/main adresinden giris yap (Google ile olabilir).\n"
+            "2. F12 > Network > sayfayi yenile > aksis.iuc.edu.tr istegine tikla > Request Headers > "
+            "'cookie' degerinin tamamini kopyala.\n"
+            "3. .env dosyasindaki IDS_COOKIE= satirina yapistir ve kaydet.\n\n"
+            "Script'i yeniden baslatmana gerek yok, birkac dakika icinde kendisi tekrar dener.")
+    try:
+        send_mail(cfg, "Sinav takip: OBS oturumu bitti, tekrar giris gerekiyor", body)
+        log.info("Oturum bitti maili gonderildi.")
+    except Exception as mail_exc:
+        log.error("Oturum bitti maili gonderilemedi: %s", mail_exc)
+
+
 # ----------------------------------------------------------------- ana akis
 def run(cfg, once=False):
     client = ObsClient(cfg)
-    while True:
+    expiry_notified = False
+
+    def try_login():
+        nonlocal expiry_notified
         try:
             client.login()
-            break
+            expiry_notified = False
+            return True
+        except IdsSessionExpired as exc:
+            if once:
+                raise
+            log.error("%s Tarayicidan tekrar giris yapip .env'deki IDS_COOKIE'yi guncelle. "
+                      "%d dk sonra tekrar denenecek.", exc, LOGIN_RETRY_SECONDS // 60)
+            if not expiry_notified:
+                notify_session_expired(cfg, exc)
+                expiry_notified = True
         except (LoginFailed, requests.RequestException) as exc:
             if once:
                 raise
-            # Aksis kisa surede tekrarlanan girisleri reddedebiliyor; biraz bekleyip tekrar dene
-            log.error("%s %d dk sonra tekrar denenecek.", exc, LOGIN_RETRY_SECONDS // 60)
-            time.sleep(LOGIN_RETRY_SECONDS)
+            log.error("Giris basarisiz: %s %d dk sonra tekrar denenecek.", exc, LOGIN_RETRY_SECONDS // 60)
+        return False
+
+    while not try_login():
+        time.sleep(LOGIN_RETRY_SECONDS)
 
     known, known_messages, known_documents = load_state(cfg)
     last_docs_check = 0.0
@@ -509,10 +622,6 @@ def run(cfg, once=False):
 
     while True:
         try:
-            if time.time() - client.last_login > RELOGIN_EVERY_SECONDS:
-                log.info("Periyodik yeniden giris yapiliyor...")
-                client.login()
-
             exams = client.fetch_exams()
             if cfg.check_messages:
                 known_messages = check_messages(cfg, client, known_messages, once)
@@ -534,6 +643,7 @@ def run(cfg, once=False):
                     notify_changes(cfg, changes)
             known = exams
             save_state(cfg, exams, known_messages, known_documents)
+            client.save_session()
             backoff = cfg.interval
 
             check_count += 1
@@ -547,12 +657,9 @@ def run(cfg, once=False):
 
         except (SessionExpired, LoginFailed) as exc:
             log.warning("%s Yeniden giris deneniyor...", exc)
-            try:
-                client.login()
+            if try_login():
                 continue
-            except Exception as login_exc:
-                log.error("Yeniden giris basarisiz: %s", login_exc)
-                backoff = max(LOGIN_RETRY_SECONDS, min(backoff * 2, MAX_BACKOFF_SECONDS))
+            backoff = LOGIN_RETRY_SECONDS
         except requests.RequestException as exc:
             log.warning("Baglanti hatasi: %s", exc)
             backoff = min(backoff * 2, MAX_BACKOFF_SECONDS)
