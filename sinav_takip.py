@@ -37,6 +37,8 @@ from pathlib import Path
 import requests
 import urllib3
 
+from tarayici_giris import CookieServer, ensure_local_key
+
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 STATE_PATH = BASE_DIR / "sinav_durumu.json"
@@ -68,6 +70,7 @@ EXAM_HEADERS = {
 
 MAX_BACKOFF_SECONDS = 10 * 60
 LOGIN_RETRY_SECONDS = 5 * 60
+BROWSER_RETRY_SECONDS = 30 * 60  # tarayici girisi basarisizsa tekrar acmadan once bekle
 
 log = logging.getLogger("sinav_takip")
 
@@ -84,6 +87,11 @@ class Config:
     verify_ssl: bool
     check_messages: bool
     check_documents: bool
+    browser_relogin: bool
+    aksis_username: str
+    aksis_password: str
+    chrome_path: str
+    local_key: str
     smtp_server: str = "smtp.gmail.com"
     smtp_port: int = 587
 
@@ -168,6 +176,11 @@ def load_config(args):
         verify_ssl=env("VERIFY_SSL", "false").lower() in ("1", "true", "yes"),
         check_messages=env("CHECK_MESSAGES", "true").lower() in ("1", "true", "yes"),
         check_documents=env("CHECK_DOCUMENTS", "true").lower() in ("1", "true", "yes"),
+        browser_relogin=env("OTURUM_YENILEME", "tarayici").lower() == "tarayici",
+        aksis_username=env("AKSIS_USERNAME", ""),
+        aksis_password=env("AKSIS_PASSWORD", ""),
+        chrome_path=env("CHROME_PATH", ""),
+        local_key=env("YEREL_ANAHTAR", ""),
     )
     missing = [name for name, value in [
         ("IDS_COOKIE", read_env_value("IDS_COOKIE")),
@@ -583,13 +596,27 @@ def notify_session_expired(cfg, exc):
         log.error("Oturum bitti maili gonderilemedi: %s", mail_exc)
 
 
+def start_cookie_server(cfg):
+    """Tampermonkey script'i icin yerel sunucuyu acar; acilamazsa None."""
+    key = ensure_local_key(ENV_PATH, cfg.local_key)
+    server = CookieServer(ENV_PATH, cfg.aksis_username, cfg.aksis_password, key)
+    if not server.start():
+        return None
+    log.info("Tampermonkey paneline yapistiracagin anahtar: .env'deki YEREL_ANAHTAR")
+    return server
+
+
 # ----------------------------------------------------------------- ana akis
 def run(cfg, once=False):
     client = ObsClient(cfg)
     expiry_notified = False
+    last_browser_try = 0.0
+    cookie_server = None
+    if not once:
+        cookie_server = start_cookie_server(cfg)
 
     def try_login():
-        nonlocal expiry_notified
+        nonlocal expiry_notified, last_browser_try
         try:
             client.login()
             expiry_notified = False
@@ -597,8 +624,17 @@ def run(cfg, once=False):
         except IdsSessionExpired as exc:
             if once:
                 raise
-            log.error("%s Tarayicidan tekrar giris yapip .env'deki IDS_COOKIE'yi guncelle. "
-                      "%d dk sonra tekrar denenecek.", exc, LOGIN_RETRY_SECONDS // 60)
+            log.error("%s", exc)
+            if cfg.browser_relogin and time.time() - last_browser_try >= BROWSER_RETRY_SECONDS:
+                last_browser_try = time.time()
+                if cookie_server and cookie_server.refresh_via_browser(chrome_path=cfg.chrome_path):
+                    try:
+                        client.login()
+                        expiry_notified = False
+                        return True
+                    except (LoginFailed, requests.RequestException) as retry_exc:
+                        log.error("Yeni cookie'lerle de giris olmadi: %s", retry_exc)
+            log.error("Oturum yenilenemedi. %d dk sonra tekrar denenecek.", LOGIN_RETRY_SECONDS // 60)
             if not expiry_notified:
                 notify_session_expired(cfg, exc)
                 expiry_notified = True
@@ -673,6 +709,8 @@ def main():
     parser.add_argument("--test-mail", action="store_true", help="alicilara test maili gonder ve cik")
     parser.add_argument("--yil", help="akademik yil baslangici (orn. 2026 = 2026-2027)")
     parser.add_argument("--donem", choices=["1", "2"], help="1 = Guz, 2 = Bahar")
+    parser.add_argument("--oturum-yenile", action="store_true",
+                        help="tarayiciyla yeniden girisi hemen dene (kurulumu test etmek icin)")
     parser.add_argument("-v", "--verbose", action="store_true", help="ayrintili log")
     args = parser.parse_args()
 
@@ -686,6 +724,13 @@ def main():
     cfg = load_config(args)
     if not cfg.verify_ssl:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    if args.oturum_yenile:
+        server = start_cookie_server(cfg)
+        ok = bool(server) and server.refresh_via_browser(chrome_path=cfg.chrome_path)
+        if server:
+            server.stop()
+        sys.exit(0 if ok else 1)
 
     if args.test_mail:
         send_mail(cfg, "Sinav takip - test maili",

@@ -46,6 +46,20 @@ Script her kontrolde oturumu kullandığı için oturum canlı kalır ve sunucun
 
 ---
 
+### 3. Oturum Düşünce Otomatik Yeniden Giriş (Tampermonkey)
+
+Oturum biterse script Chrome'da Aksis'i açar; Tampermonkey script'i "Oturum aç"a basar, kullanıcı adı/şifreyi doldurur, "Oturum açık kalsın"ı işaretler ve **Cloudflare doğrulamasını senin onaylamanı bekler**. Onaylayınca (ya da 20 sn sonra) "Giriş"e basar, cookie'leri script'e verir, sekmeyi kapatır. 10 dakika içinde giriş olmazsa sana mail atar.
+
+Bir kerelik kurulum (script'in çalıştığı bilgisayarda):
+
+1. Chrome'a **Tampermonkey** eklentisini kur.
+2. `chrome://extensions` → Tampermonkey → **Ayrıntılar** → **Kullanıcı komut dosyalarına izin ver** (Allow User Scripts) açık olsun.
+3. Tampermonkey → **Yeni script oluştur** → içeriği sil, `aksis_otomatik_giris.user.js`'in tamamını yapıştır, kaydet.
+4. Tampermonkey → **Ayarlar** → Yapılandırma modu: **Gelişmiş** → **Güvenlik** → *Script'lerin cookie'lere erişimine izin ver*: **Tümü**.
+5. `.env`'e `AKSIS_USERNAME` ve `AKSIS_PASSWORD` yaz.
+
+Script'i `baslat.bat` ile başlatırsan kapanınca kendini yeniden açar.
+
 ## Diğer Ayarlar
 
 - Alıcıları `EMAIL_TO_LIST`'e virgülle ayırarak yaz.
