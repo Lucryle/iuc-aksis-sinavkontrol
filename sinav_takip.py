@@ -322,6 +322,19 @@ class ObsClient:
             raise SessionExpired("Yazismalarim sayfasinda token bulunamadi (oturum dusmus olabilir).")
         self.chat_token = match.group(1)
 
+    def fetch_message_texts(self, kisi_cid):
+        """Bir konusmadaki tum mesajlar (eskiden yeniye). Not: OBS konusmayi okundu isaretler."""
+        if not self.chat_token:
+            self._load_chat_token()
+        resp = self.session.get(f"{OBS_URL}/api/Yazisma/GetirYazismaMetinler", timeout=30,
+                                headers={"Accept": "application/json"},
+                                params={"token": self.chat_token, "kisiCid": kisi_cid})
+        resp.raise_for_status()
+        payload = resp.json()
+        if not (isinstance(payload, dict) and payload.get("IsSuccess")):
+            raise SessionExpired("Mesaj metinleri alinamadi.")
+        return payload.get("Object") or []
+
     def fetch_messages(self, count=20):
         """Son yazismalari (her hoca icin bir konusma) dondurur."""
         for attempt in range(2):
@@ -506,17 +519,47 @@ def notify_changes(cfg, changes):
         log.error("Mail gonderilemedi: %s", exc)
 
 
-def notify_messages(cfg, conversations):
+def message_block(client, c, old_fingerprint=None):
+    """Konusmadaki YENI mesajlarin tam metnini getirir (bir onceki kontrolde gorulen son mesajdan
+    sonrakiler; o bulunamazsa sadece en son mesaj). Alinamazsa OBS'nin onizlemesine duser."""
+    header = f"Gonderen : {sender_name(c)}\n"
+    try:
+        items = client.fetch_message_texts(c.get("MuhatapKisiIDEncrypted"))
+    except Exception as exc:
+        log.warning("Mesajin tamami alinamadi, onizleme kullaniliyor: %s", exc)
+        items = []
+    other = str(c.get("MuhatapKisiID"))
+    recent = []
+    for item in reversed(items):  # liste eskiden yeniye; sondan geriye, senin son mesajina kadar
+        if str(item.get("FKGonderenKisiID")) != other:
+            break
+        recent.append(item)
+    recent = list(reversed(recent[:10]))
+    # Bir onceki kontrolde gorulen son mesaji bul; ondan sonrakileri goster
+    old_preview = (old_fingerprint or "").split("|", 1)[-1].rstrip(".").strip() if old_fingerprint else ""
+    if recent and old_preview:
+        for idx in range(len(recent) - 1, -1, -1):
+            if str(recent[idx].get("Metin", "")).strip().startswith(old_preview[:40]):
+                recent = recent[idx + 1:] or recent[-1:]
+                break
+        else:
+            recent = recent[-1:]
+    elif recent:
+        recent = recent[-1:]
+    if not recent:
+        return (header + f"Zaman    : {c.get('SGZamanString', '')}\n"
+                f"Mesaj    : {c.get('SonMetin', '')}")
+    parts = [f"[{m.get('Zaman', '')}]\n{str(m.get('Metin', '')).strip()}" for m in recent]
+    return header + "\n\n".join(parts)
+
+
+def notify_messages(cfg, client, conversations, known=None):
     if len(conversations) == 1:
         subject = f"OBS'de yeni mesaj: {sender_name(conversations[0])}"
     else:
         subject = f"OBS'de {len(conversations)} yeni mesaj"
-    blocks = [
-        f"Gonderen : {sender_name(c)}\n"
-        f"Zaman    : {c.get('SGZamanString', '')}\n"
-        f"Mesaj    : {c.get('SonMetin', '')}"
-        for c in conversations
-    ]
+    known = known or {}
+    blocks = [message_block(client, c, known.get(str(c.get("ID")))) for c in conversations]
     body = "\n\n".join(blocks) + f"\n\nTum yazismalar: {CHAT_PAGE_URL}"
     try:
         send_mail(cfg, subject, body)
@@ -577,7 +620,7 @@ def check_messages(cfg, client, known, once):
         for c in new:
             log.info("Yeni mesaj: %s", sender_name(c))
         if new:
-            notify_messages(cfg, new)
+            notify_messages(cfg, client, new, known)
     return message_state(conversations)
 
 
